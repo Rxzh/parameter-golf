@@ -764,7 +764,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_polar_express
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
