@@ -1,4 +1,20 @@
-# parameter-golf autoresearch
+# autoresearch
+
+This is an experiment to have the LLM do its own research.
+
+## Setup
+
+To set up a new experiment, work with the user to:
+
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
+3. **Read the in-scope files**: The repo is small. Read these files for full context:
+   - `README.md` — repository context.
+   - `train.py` — the file you can modify, you can modify: Model architecture, optimizer, training loop. DO NOT MODIFY: data prep, tokenizer, dataloader, evaluation.
+4. **Verify data exists**
+5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+6. **Confirm and go**: Confirm setup looks good.
+
 
 You are an autonomous LLM research loop. Your job: iteratively improve `train_gpt.py` to minimize `val_bpb` (bits-per-byte, post-quantization) on FineWeb validation, while keeping the compressed artifact ≤ 16,000,000 bytes and `train_gpt.py` ≤ 1500 lines.
 
@@ -23,145 +39,68 @@ You are an autonomous LLM research loop. Your job: iteratively improve `train_gp
 
 ---
 
-## Experiment loop (LOOP FOREVER, NEVER STOP)
-
-### 1. Check git state
-```bash
-git status
-git log --oneline -5
-```
-
-### 2. Pick next experiment
-Choose from the priority tiers below. Pick the highest-tier untried idea.
-
-### 3. Edit `train_gpt.py`
-One focused change. Do not bundle multiple hypotheses.
-Check line count stays ≤ 1500: `wc -l train_gpt.py`
-
-### 4. Commit
-```bash
-git add train_gpt.py
-git commit -m "exp: <short description>"
-```
-
-### 5. Run (always this exact command)
-```bash
-TRAIN_BATCH_TOKENS=65536 MAX_WALLCLOCK_SECONDS=120 VAL_LOSS_EVERY=200 \
-  torchrun --standalone --nproc_per_node=1 train_gpt.py > run.log 2>&1
-```
-
-### 6. Read metrics
-```bash
-grep "^val_bpb:" run.log
-grep "^compressed_bytes:" run.log
-```
-
-If either grep returns nothing: the run crashed. Check `tail -30 run.log` and fix.
-
-### 7. Hard size gate
-If `compressed_bytes > 16000000`: mark `size_fail`, `git reset --hard HEAD~1`, move on.
-
-### 8. BPB gate
-Compare `val_bpb` to current best in `results.tsv`.
-- **val_bpb ≥ current best**: mark `discarded`, `git reset --hard HEAD~1`, move on.
-- **val_bpb < current best**: KEEP. Update `results.tsv`, advance the branch.
-
-### 9. Log to results.tsv
-```
-<commit_hash>	<val_bpb>	<compressed_bytes>	<kept|discarded|size_fail>	<description>
-```
-
-### 10. Strong win check
-If improvement > 0.010 BPB: note it as a candidate for a full 8×H100 run.
-
----
-
-## Output format
-
-`train_gpt.py` emits these lines at the very end (rank 0 only):
-```
----
-val_bpb:          X.XXXXXX
-compressed_bytes: NNNNNNN
-```
-
-These are the only lines you need. The `^val_bpb:` and `^compressed_bytes:` prefixes make them greppable.
-
----
-
 ## Constraints (hard — never violate)
 
 | Constraint | Value |
 |---|---|
 | `compressed_bytes` ≤ | 16,000,000 |
 | `VOCAB_SIZE` | 1024 (fixed by challenge) |
-| `train_gpt.py` lines ≤ | 1500 |
+| `train_gpt.py` lines ≤ | 1500 |``
+| Training time ≤ | 10 minutes |
 | Edit only | `train_gpt.py` |
 | Quantization code | READ-ONLY (do not touch lines after `POST-TRAINING QUANTIZATION` comment) |
 | BPB evaluation logic | READ-ONLY |
 
 ---
 
-## Experiment ideas (priority order)
+## Logging results
 
-### Tier 1 — Architecture scaling (use ~5.1M param headroom)
-Baseline: 17.06M params, 15,863,489 bytes. ~136KB headroom ≈ ~5.1M more params.
+When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-| Idea | Param delta | Est. BPB gain | Notes |
-|---|---|---|---|
-| `MLP_MULT` 2→3 | +4.7M | 0.010–0.025 | Increases MLP width |
-| `MODEL_DIM` 512→576 | +4.4M | 0.010–0.020 | Wider model |
-| `NUM_LAYERS` 9→11 | +3.7M | 0.008–0.018 | Deeper model |
+The TSV has a header row and 5 columns:
 
-Try only one at a time. Combine after individual wins confirmed.
+```
+commit	val_bpb	memory_gb	status	description
+```
 
-### Tier 2 — Architecture quality (same param count)
+1. git commit hash (short, 7 chars)
+2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
+3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+4. status: `keep`, `discard`, or `crash`
+5. short text description of what this experiment tried
 
-| Idea | Notes |
-|---|---|
-| Value embeddings | Add learned per-token value residual (see autoresearch/train.py) |
-| SwiGLU MLP | Replace `relu²` with `silu(gate) * value`; add gate proj |
-| QAT | Simulate int8 quantization noise during training to close the +0.0072 BPB quant gap |
-| Windowed attention | Alternate short-context (128) and full-context layers |
+Example:
 
-### Tier 3 — Optimizer / schedule tuning
+```
+commit	val_bpb	memory_gb	status	description
+a1b2c3d	0.997900	44.0	keep	baseline
+b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
+c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
+d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```
 
-| Hyperparameter | Values to try |
-|---|---|
-| `MATRIX_LR` | 0.02, 0.03, 0.05, 0.06 |
-| `MUON_WEIGHT_DECAY` | 0.1, 0.2, 0.3 |
-| `MUON_MOMENTUM` | 0.90, 0.92, 0.97 |
-| `warmdown_iters` | 800, 1000, 1500 |
-| `MUON_BETA2` | 0.90, 0.99 |
+## The experiment loop
 
-### Tier 4 — Training dynamics
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
 
-| Idea | Notes |
-|---|---|
-| `warmup_steps` 20→5 | Faster initial LR ramp |
-| `TRAIN_BATCH_TOKENS=1048576` | Larger batch |
-| `grad_clip_norm=1.0` | Add gradient clipping |
+LOOP FOREVER:
 
----
+1. Look at the git state: the current branch/commit we're on
+2. Tune `train_gpt.py` with an experimental idea by directly hacking the code.
+3. git commit
+4. Run the experiment: `python train_gpt.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
+8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+9. If val_bpb is equal or worse, you git reset back to where you started
 
-## Notes on the current baseline
+The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-The baseline (`main` branch after NorMuon port) uses:
-- **NorMuon**: polar_express orthogonalization + variance normalization via second momentum buffer
-- **Cautious weight decay**: only decays when update and weight have same sign
-- 9 layers × 512 dim, GQA (8 query / 4 KV heads), ReLU² MLP (mult=2), RoPE, RMSNorm
-- Tied input/output embeddings
-- Vocab: 1024 (SentencePiece BPE)
-- Adam for embeddings (lr=0.05), Muon for matrices (lr=0.04), Adam for scalars (lr=0.04)
-- 20,000 iterations, 524,288 tokens/batch, 10-minute wall-clock cap
+**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-The proxy command uses 120s and 65536 tokens/batch — fast enough to rank experiments, not identical to full run. A proxy BPB improvement of ≥0.005 is reliable signal.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
----
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-## Submitting a strong result
-
-When a full 8×H100 run beats `val_bpb = 1.2244` by ≥ 0.005:
-1. Copy `train_gpt.py` to `records/track_10min_16mb/<run_name>/train_gpt.py`
-2. Add `README.md`, `submission.json`, `train.log` to that directory
-3. Open a PR adding only the `records/` directory
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
