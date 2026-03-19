@@ -81,6 +81,8 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -93,27 +95,39 @@ class Hyperparameters:
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
-    a, b, c = (3.4445, -4.7750, 2.0315)
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+def zeropower_via_polar_express(G: Tensor, steps: int = 5) -> Tensor:
+    # Orthogonalize a 2D update matrix using polar express Newton-Schulz coefficients.
+    # Uses per-step optimized (a,b,c) coefficients for better orthogonalization quality.
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
-    if transposed:
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    return X.T if transposed else X
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if G.size(0) > G.size(1):  # tall matrix: X is (n,m) n>m
+        for a, b, c in polar_express_coeffs[:steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:  # wide matrix: X is (n,m) n<=m
+        for a, b, c in polar_express_coeffs[:steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 nesterov: bool = True, beta2: float = 0.95, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov,
+                 beta2=beta2, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -135,6 +149,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            beta2 = group.get("beta2", 0.95)
+            weight_decay = group.get("weight_decay", 0.0)
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -150,7 +166,22 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g = zeropower_via_polar_express(g, steps=backend_steps)
+                    # NorMuon: variance normalization via second momentum buffer
+                    red_dim = -1 if g.size(0) >= g.size(1) else -2
+                    if "second_momentum_buffer" not in state:
+                        buf_shape = (g.size(0), 1) if red_dim == -1 else (1, g.size(1))
+                        state["second_momentum_buffer"] = torch.zeros(buf_shape, dtype=torch.float32, device=g.device)
+                    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+                    red_dim_size = g.size(red_dim)
+                    v_norm = (v_mean.sum() * red_dim_size).sqrt()
+                    buf2 = state["second_momentum_buffer"]
+                    buf2.lerp_(v_mean, 1 - beta2)
+                    step_size = buf2.clamp_min(1e-10).rsqrt()
+                    scaled_sq_sum = (v_mean * red_dim_size) * step_size.square()
+                    v_norm_new = scaled_sq_sum.sum().sqrt()
+                    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+                    g = g * final_scale.to(g.dtype)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -162,7 +193,11 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
+                if weight_decay > 0.0:
+                    mask = (g * p.data) >= 0
+                    p.add_(g + weight_decay * p.data * mask, alpha=-lr)
+                else:
+                    p.add_(g, alpha=-lr)
                 curr += p.numel()
 
         return loss
@@ -733,7 +768,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_polar_express = torch.compile(zeropower_via_polar_express)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -873,6 +908,8 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        beta2=args.muon_beta2,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1117,6 +1154,12 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if master_process:
+        # autoresearch-compatible summary (enables: grep "^val_bpb:" run.log)
+        log0("---")
+        log0(f"val_bpb:          {q_val_bpb:.6f}")
+        log0(f"compressed_bytes: {quant_file_bytes + code_bytes}")
 
     if distributed:
         dist.destroy_process_group()
